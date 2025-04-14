@@ -1,106 +1,241 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import ast
+import matplotlib.pyplot as plt
+
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import cross_validate, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
-from scipy.sparse import hstack, csr_matrix
+from sklearn.model_selection import cross_validate, KFold
+from sklearn.metrics import precision_score, recall_score, f1_score, make_scorer
 
-st.title("Disease Classification: KNN & Logistic Regression Experiments")
+# --------------------
+# Label Generator Function
+# --------------------
+def generate_disease_labels(df, output_path="disease_labels.csv"):
+    if "Disease" in df.columns:
+        labels = df["Disease"]
+    elif "Subtypes" in df.columns:
+        labels = df["Subtypes"]
+    else:
+        labels = pd.Series(["unknown"] * df.shape[0])
 
+    max_labels = 50
+    if labels.nunique() > max_labels:
+        top_labels = labels.value_counts().index[:max_labels]
+        labels = labels.apply(lambda x: x if x in top_labels else "Other")
+
+    labels_df = pd.DataFrame({"Label": labels})
+    labels_df.to_csv(output_path, index=False)
+    return labels_df["Label"]
+
+# --------------------
+# Data Loading Functions
+# --------------------
 @st.cache_data
+def load_csv(file_path):
+    try:
+        return pd.read_csv(file_path)
+    except Exception as e:
+        st.error(f"Error loading {file_path}: {e}")
+        return None
+
 def load_data():
-    df = pd.read_csv("disease_features.csv")
-    encoded_df = pd.read_csv("encoded_output2.csv")
-    return df, encoded_df
+    df_text = load_csv("disease_features.csv")
+    df_onehot = load_csv("encoded_output2.csv")
+    if df_text is None or df_onehot is None:
+        st.stop()
+    return df_text, df_onehot
 
-df, encoded_df = load_data()
+# --------------------
+# Data Preparation
+# --------------------
+def prepare_text_data(df_text, text_col, label_col):
+    vectorizer = TfidfVectorizer()
+    X_tfidf = vectorizer.fit_transform(df_text[text_col])
+    y = df_text[label_col]
+    return X_tfidf, y
 
-def parse_and_join(text):
-    lst = ast.literal_eval(text)
-    return " ".join(lst)
+def prepare_onehot_data(df_onehot, label_col):
+    X_onehot = df_onehot.drop(label_col, axis=1)
+    y = df_onehot[label_col]
+    return X_onehot, y
 
-for col in ["Risk Factors", "Symptoms", "Signs"]:
-    df[col] = df[col].apply(parse_and_join)
+# --------------------
+# Model Evaluation
+# --------------------
+def check_for_nans(X):
+    """Optional helper to remove or replace NaNs or inf."""
+    if hasattr(X, "toarray"):  # it's sparse
+        X_arr = X.toarray()
+    else:
+        X_arr = np.array(X)
 
-tfidf_rf = TfidfVectorizer()
-tfidf_symptoms = TfidfVectorizer()
-tfidf_signs = TfidfVectorizer()
-matrix_rf = tfidf_rf.fit_transform(df["Risk Factors"])
-matrix_symptoms = tfidf_symptoms.fit_transform(df["Symptoms"])
-matrix_signs = tfidf_signs.fit_transform(df["Signs"])
-tfidf_matrix = hstack([matrix_rf, matrix_symptoms, matrix_signs])
+    # If needed, you can replace with 0 or drop them
+    # In this example, we only check but do not fix:
+    if np.isnan(X_arr).any() or np.isinf(X_arr).any():
+        raise ValueError("Data contains NaN or inf. Fix or remove them before training.")
+    return X  # or X_arr if you want to directly convert
 
-onehot_numeric = encoded_df.apply(pd.to_numeric, errors="coerce").fillna(0).values.astype(float)
-onehot_sparse = csr_matrix(onehot_numeric)
+def compute_knn_results(X, y, k_values, metrics_list, cv, scoring):
+    """
+    Runs KNN with cross-validation for each combination of k in k_values and
+    distance metric in metrics_list, returning a dictionary of results.
+    """
+    # Check for NaNs or infinite values
+    check_for_nans(X)
 
-if "Category" in df.columns:
-    target = df["Category"]
-elif "Subtype" in df.columns:
-    target = df["Subtype"]
-else:
-    st.error("No target column found for classification. Please include 'Category' or 'Subtype' in your dataset.")
-    target = pd.Series(["unknown"] * df.shape[0])
+    results = {}
+    for metric in metrics_list:
+        for k in k_values:
+            try:
+                # Make a dense copy for metrics that need it
+                if metric in ["manhattan", "cosine"]:
+                    if hasattr(X, "toarray"):
+                        X_used = X.toarray() 
+                    else:
+                        X_used = np.array(X)
+                else:
+                    X_used = X
 
-def run_knn_experiments(matrix, target, encoding_label):
-    ks = [3, 5, 7]
-    distance_metrics = {"Euclidean": "euclidean", "Manhattan": "manhattan", "Cosine": "cosine"}
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    results = []
-    for dist_name, metric in distance_metrics.items():
-        for k in ks:
-            if metric == "cosine":
-                knn = KNeighborsClassifier(n_neighbors=k, metric=metric, algorithm="brute")
-            else:
+                # Directly use metric="manhattan" (or "cosine")
                 knn = KNeighborsClassifier(n_neighbors=k, metric=metric)
-            scoring = {
-                "accuracy": "accuracy",
-                "precision": "precision_macro",
-                "recall": "recall_macro",
-                "f1": "f1_macro"
-            }
-            scores = cross_validate(knn, matrix, target, cv=skf, scoring=scoring, n_jobs=-1)
-            results.append({
-                "Model": "KNN",
-                "Encoding": encoding_label,
-                "K": k,
-                "Distance Metric": dist_name,
-                "Accuracy": np.mean(scores["test_accuracy"]),
-                "Precision": np.mean(scores["test_precision"]),
-                "Recall": np.mean(scores["test_recall"]),
-                "F1-Score": np.mean(scores["test_f1"])
-            })
-    return pd.DataFrame(results)
 
-def run_logreg_experiments(matrix, target, encoding_label):
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    logreg = LogisticRegression(max_iter=1000, solver="liblinear")
-    scoring = {"accuracy": "accuracy", "f1": "f1_macro"}
-    scores = cross_validate(logreg, matrix, target, cv=skf, scoring=scoring, n_jobs=-1)
-    return {
-        "Model": "Logistic Regression",
-        "Encoding": encoding_label,
-        "Accuracy": np.mean(scores["test_accuracy"]),
-        "F1-Score": np.mean(scores["test_f1"])
+                # If you want Minkowski with p=1, do:
+                # if metric == "manhattan":
+                #     knn = KNeighborsClassifier(n_neighbors=k, metric="minkowski", p=1)
+                # else:
+                #     knn = KNeighborsClassifier(n_neighbors=k, metric=metric)
+
+                cv_results = cross_validate(knn, X_used, y, cv=cv, scoring=scoring)
+
+                results[(k, metric)] = {
+                    m: np.mean(cv_results[f'test_{m}']) for m in scoring
+                }
+
+            except Exception as e:
+                # Print entire error
+                st.error(f"[ERROR] KNN: k={k}, metric={metric} => {type(e).__name__}: {e}")
+                results[(k, metric)] = {m: None for m in scoring}
+
+    return results
+
+def compute_logistic_results(X, y, cv, scoring):
+    lr = LogisticRegression(max_iter=1000)
+    cv_results = cross_validate(lr, X, y, cv=cv, scoring=scoring)
+    return {m: np.mean(cv_results[f'test_{m}']) for m in scoring}
+
+def format_results_dict(results_dict):
+    rows = []
+    for (k, metric), metrics in results_dict.items():
+        row = {"k": k, "Distance Metric": metric}
+        row.update(metrics)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def plot_metric_bar_chart(df, metric, title):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for dist_metric, grp in df.groupby("Distance Metric"):
+        ax.bar(grp["k"].astype(str), grp[metric], label=dist_metric)
+    ax.set_title(title)
+    ax.set_xlabel("k Value")
+    ax.set_ylabel(metric.capitalize())
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.6)
+    st.pyplot(fig)
+
+# --------------------
+# Main Streamlit App
+# --------------------
+def main():
+    st.set_page_config(page_title="Disease Model Evaluation", layout="wide")
+    st.title("Disease Model Evaluation")
+    
+    df_text, df_onehot = load_data()
+    generate_disease_labels(df_text)
+    
+    with st.sidebar:
+        st.title("Configuration")
+
+        with st.expander("1. Select Data Columns"):
+            text_col = st.selectbox("Text Column", df_text.columns.tolist())
+            label_col_text = st.selectbox("Label Column (Text File)", df_text.columns.tolist())
+            label_col_onehot = st.selectbox("Label Column (One-Hot File)", df_onehot.columns.tolist())
+
+        with st.expander("2. Filter by Disease"):
+            diseases = sorted(df_text[label_col_text].unique().tolist())
+            selected_diseases = st.multiselect("Select Diseases", diseases, default=diseases)
+            df_text = df_text[df_text[label_col_text].isin(selected_diseases)]
+            df_onehot = df_onehot[df_onehot[label_col_onehot].isin(selected_diseases)]
+
+        with st.expander("3. Model and Encoding Options"):
+            encoding_option = st.radio("Encoding", ["TF‑IDF", "One‑hot", "Both"])
+            model_option = st.radio("Model", ["KNN", "Logistic Regression", "Both"])
+
+        with st.expander("🔍 Data Preview", expanded=False):
+            st.write("**Text Data Sample:**")
+            st.dataframe(df_text.head())
+            st.write("**One-Hot Encoded Sample:**")
+            st.dataframe(df_onehot.head())
+
+    X_tfidf, y_tfidf = None, None
+    X_onehot, y_onehot = None, None
+
+    if encoding_option in ("TF‑IDF", "Both"):
+        X_tfidf, y_tfidf = prepare_text_data(df_text, text_col, label_col_text)
+        st.write("TF‑IDF matrix shape:", X_tfidf.shape)
+    if encoding_option in ("One‑hot", "Both") and df_onehot.shape[0] >= 5:
+        X_onehot, y_onehot = prepare_onehot_data(df_onehot, label_col_onehot)
+        st.write("One‑hot features shape:", X_onehot.shape)
+
+    k_values = [3, 5, 7]
+    distance_metrics = ["euclidean", "manhattan", "cosine"]
+    scoring = {
+        "accuracy": "accuracy",
+        "precision": make_scorer(precision_score, average="weighted", zero_division=0),
+        "recall": make_scorer(recall_score, average="weighted", zero_division=0),
+        "f1": make_scorer(f1_score, average="weighted", zero_division=0)
     }
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
 
-st.header("KNN Experiments")
-knn_results_tfidf = run_knn_experiments(tfidf_matrix, target, "TF-IDF")
-knn_results_onehot = run_knn_experiments(onehot_numeric, target, "One-hot")
-knn_results = pd.concat([knn_results_tfidf, knn_results_onehot], ignore_index=True)
-st.dataframe(knn_results)
+    tabs = st.tabs(["KNN Model", "Logistic Regression", "Comparison"])
 
-st.header("Logistic Regression Experiments")
-logreg_result_tfidf = run_logreg_experiments(tfidf_matrix, target, "TF-IDF")
-logreg_result_onehot = run_logreg_experiments(onehot_numeric, target, "One-hot")
-logreg_results = pd.DataFrame([logreg_result_tfidf, logreg_result_onehot])
-st.dataframe(logreg_results)
+    with tabs[0]:
+        st.header("KNN Model Results")
+        # TF‑IDF Results
+        if encoding_option in ("TF‑IDF", "Both") and model_option in ("KNN", "Both"):
+            st.subheader("TF‑IDF")
+            results = compute_knn_results(X_tfidf, y_tfidf, k_values, distance_metrics, cv, scoring)
+            df_results = format_results_dict(results)
+            st.dataframe(df_results)
+            plot_metric_bar_chart(df_results, "accuracy", "KNN Accuracy (TF‑IDF)")
 
-st.header("Summary Comparison")
-st.write("The tables above provide the cross-validated metrics for each configuration. You can compare results across:")
-st.write("- **Encoding Methods:** TF-IDF vs. One-hot")
-st.write("- **Distance Metrics (KNN only):** Euclidean, Manhattan, and Cosine")
-st.write("- **Model Types:** KNN vs. Logistic Regression")
-st.write("Generally, higher Accuracy and F1-Score indicate better performance. Analyze which configurations yield the best separability for your disease classification task.")
+        # One‑hot Results
+        if encoding_option in ("One‑hot", "Both") and model_option in ("KNN", "Both") and X_onehot is not None:
+            st.subheader("One‑hot")
+            results = compute_knn_results(X_onehot, y_onehot, k_values, distance_metrics, cv, scoring)
+            df_results = format_results_dict(results)
+            st.dataframe(df_results)
+            plot_metric_bar_chart(df_results, "accuracy", "KNN Accuracy (One‑hot)")
+
+    with tabs[1]:
+        st.header("Logistic Regression Results")
+        # TF‑IDF Results
+        if encoding_option in ("TF‑IDF", "Both") and model_option in ("Logistic Regression", "Both"):
+            st.subheader("TF‑IDF")
+            results = compute_logistic_results(X_tfidf, y_tfidf, cv, scoring)
+            st.dataframe(pd.DataFrame([results]))
+
+        # One‑hot Results
+        if encoding_option in ("One‑hot", "Both") and model_option in ("Logistic Regression", "Both") and X_onehot is not None:
+            st.subheader("One‑hot")
+            results = compute_logistic_results(X_onehot, y_onehot, cv, scoring)
+            st.dataframe(pd.DataFrame([results]))
+
+    with tabs[2]:
+        st.header("Summary & Comparison")
+        st.markdown("Compare results of models using different encodings.")
+        st.info("Use the tabs above to explore KNN and Logistic Regression results.")
+
+if __name__ == '__main__':
+    main()
