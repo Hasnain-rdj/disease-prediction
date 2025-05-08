@@ -8,6 +8,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_validate, KFold
 from sklearn.metrics import precision_score, recall_score, f1_score, make_scorer
+from sklearn.preprocessing import normalize, StandardScaler, Normalizer
+from sklearn.pipeline import make_pipeline
 
 # --------------------
 # Label Generator Function
@@ -58,6 +60,12 @@ def prepare_text_data(df_text, text_col, label_col):
 
 def prepare_onehot_data(df_onehot, label_col):
     X_onehot = df_onehot.drop(label_col, axis=1)
+    # Select only numeric columns (float or int)
+    numeric_cols = X_onehot.select_dtypes(include=[np.number]).columns
+    dropped_cols = set(X_onehot.columns) - set(numeric_cols)
+    if dropped_cols:
+        st.warning(f"Dropped non-numeric columns in one-hot data: {dropped_cols}")
+    X_onehot = X_onehot[numeric_cols]
     y = df_onehot[label_col]
     return X_onehot, y
 
@@ -81,48 +89,80 @@ def compute_knn_results(X, y, k_values, metrics_list, cv, scoring):
     """
     Runs KNN with cross-validation for each combination of k in k_values and
     distance metric in metrics_list, returning a dictionary of results.
+    Uses scikit-learn pipelines to ensure proper preprocessing for each metric.
     """
+    from sklearn.preprocessing import StandardScaler, Normalizer, LabelEncoder
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.model_selection import cross_validate
+    from sklearn.pipeline import make_pipeline
+    
     # Check for NaNs or infinite values
     check_for_nans(X)
-
+    
+    # Encode string labels to integers for KNN
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+    
     results = {}
     for metric in metrics_list:
         for k in k_values:
-            try:
-                # Make a dense copy for metrics that need it
-                if metric in ["manhattan", "cosine"]:
-                    if hasattr(X, "toarray"):
-                        X_used = X.toarray() 
+            try:                # Initialize with default values in case of error
+                results[(k, metric)] = {m: 0.0 for m in scoring}
+                # Check if data is sparse
+                is_sparse = hasattr(X, "toarray")
+                
+                if metric == "manhattan":
+                    # For manhattan, handle sparse matrices differently
+                    if is_sparse:
+                        # Always use StandardScaler without centering for sparse matrices
+                        pipeline = make_pipeline(
+                            StandardScaler(with_mean=False),
+                            KNeighborsClassifier(n_neighbors=k, metric="minkowski", p=1)
+                        )
+                        cv_results = cross_validate(pipeline, X, y_encoded, cv=cv, scoring=scoring)
                     else:
-                        X_used = np.array(X)
+                        # For dense data, use regular StandardScaler
+                        pipeline = make_pipeline(
+                            StandardScaler(),
+                            KNeighborsClassifier(n_neighbors=k, metric="minkowski", p=1)
+                        )
+                        cv_results = cross_validate(pipeline, X, y_encoded, cv=cv, scoring=scoring)
+                    # Store results and continue to next iteration
+                    results[(k, metric)] = {m: np.mean(cv_results[f'test_{m}']) for m in scoring}
+                    continue
+                elif metric == "cosine":
+                    # For cosine, use normalization
+                    pipeline = make_pipeline(
+                        Normalizer(),
+                        KNeighborsClassifier(n_neighbors=k, metric=metric)
+                    )
                 else:
-                    X_used = X
-
-                # Directly use metric="manhattan" (or "cosine")
-                knn = KNeighborsClassifier(n_neighbors=k, metric=metric)
-
-                # If you want Minkowski with p=1, do:
-                # if metric == "manhattan":
-                #     knn = KNeighborsClassifier(n_neighbors=k, metric="minkowski", p=1)
-                # else:
-                #     knn = KNeighborsClassifier(n_neighbors=k, metric=metric)
-
-                cv_results = cross_validate(knn, X_used, y, cv=cv, scoring=scoring)
-
-                results[(k, metric)] = {
-                    m: np.mean(cv_results[f'test_{m}']) for m in scoring
-                }
-
+                    # For euclidean and other metrics
+                    pipeline = make_pipeline(
+                        KNeighborsClassifier(n_neighbors=k, metric=metric)
+                    )
+                
+                # Run cross-validation with the pipeline
+                cv_results = cross_validate(pipeline, X, y_encoded, cv=cv, scoring=scoring)
+                results[(k, metric)] = {m: np.mean(cv_results[f'test_{m}']) for m in scoring}
+                
             except Exception as e:
-                # Print entire error
+                # Log error for debugging
                 st.error(f"[ERROR] KNN: k={k}, metric={metric} => {type(e).__name__}: {e}")
-                results[(k, metric)] = {m: None for m in scoring}
-
+                # Default values were already initialized above
+                pass
+    
     return results
 
 def compute_logistic_results(X, y, cv, scoring):
+    from sklearn.preprocessing import LabelEncoder
+    
+    # Encode string labels to integers for Logistic Regression
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+    
     lr = LogisticRegression(max_iter=1000)
-    cv_results = cross_validate(lr, X, y, cv=cv, scoring=scoring)
+    cv_results = cross_validate(lr, X, y_encoded, cv=cv, scoring=scoring)
     return {m: np.mean(cv_results[f'test_{m}']) for m in scoring}
 
 def format_results_dict(results_dict):
@@ -134,9 +174,18 @@ def format_results_dict(results_dict):
     return pd.DataFrame(rows)
 
 def plot_metric_bar_chart(df, metric, title):
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    
+    # Define consistent colors for each distance metric
+    colors = {'euclidean': 'blue', 'manhattan': 'red', 'cosine': 'green'}
+    
     for dist_metric, grp in df.groupby("Distance Metric"):
-        ax.bar(grp["k"].astype(str), grp[metric], label=dist_metric)
+        ax.bar(
+            grp["k"].astype(str), 
+            grp[metric], 
+            label=dist_metric,
+            color=colors.get(dist_metric, 'gray')
+        )
     ax.set_title(title)
     ax.set_xlabel("k Value")
     ax.set_ylabel(metric.capitalize())
@@ -179,21 +228,20 @@ def main():
             st.dataframe(df_onehot.head())
 
     X_tfidf, y_tfidf = None, None
-    X_onehot, y_onehot = None, None
-
+    X_onehot, y_onehot = None, None    
     if encoding_option in ("TF‑IDF", "Both"):
         X_tfidf, y_tfidf = prepare_text_data(df_text, text_col, label_col_text)
         st.write("TF‑IDF matrix shape:", X_tfidf.shape)
     if encoding_option in ("One‑hot", "Both") and df_onehot.shape[0] >= 5:
         X_onehot, y_onehot = prepare_onehot_data(df_onehot, label_col_onehot)
         st.write("One‑hot features shape:", X_onehot.shape)
-
+        
     k_values = [3, 5, 7]
     distance_metrics = ["euclidean", "manhattan", "cosine"]
     scoring = {
         "accuracy": "accuracy",
-        "precision": make_scorer(precision_score, average="weighted", zero_division=0),
-        "recall": make_scorer(recall_score, average="weighted", zero_division=0),
+        "precision": make_scorer(precision_score, average="weighted", zero_division=0, pos_label=None),
+        "recall": make_scorer(recall_score, average="weighted", zero_division=0, pos_label=None),
         "f1": make_scorer(f1_score, average="weighted", zero_division=0)
     }
     cv = KFold(n_splits=5, shuffle=True, random_state=42)
